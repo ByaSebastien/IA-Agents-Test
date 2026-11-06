@@ -118,6 +118,101 @@ Codex lit automatiquement le fichier `AGENTS.md` à la racine du dossier dans le
 
 MCP (*Model Context Protocol*) est un protocole standard qui permet de brancher des outils externes sur un assistant IA. Il était prévu au départ pour connecter Codex, mais **la version de Codex utilisée (0.165) n'offre plus de mode serveur MCP** : on est donc passé par la ligne de commande. Voir la [section 7](#7-problèmes-rencontrés-et-solutions).
 
+### 2.7 En coulisses : contexte, cache et coûts
+
+#### Le modèle n'a pas de mémoire
+
+L'API de Claude est **sans mémoire** : à chaque appel, il faut lui renvoyer **tout le contexte**. Une « conversation », c'est en fait un dossier qu'on renvoie en entier à chaque fois, en y ajoutant la nouvelle étape.
+
+Pour un sous-agent :
+
+```
+┌─ Appel n°1 ───────────────────────────────┐
+│ Consigne système  ← le fichier .md        │
+│ Liste des outils  ← limitée par « tools » │
+│ Le brief          ← écrit par l'orchestrateur │
+└───────────────────────────────────────────┘
+        ↓ l'agent répond : « je lis index.html »
+┌─ Appel n°2 ───────────────────────────────┐
+│ Consigne système  (identique)             │
+│ Liste des outils  (identique)             │
+│ Le brief          (identique)             │
+│ + « je lis index.html »                   │
+│ + contenu d'index.html                    │
+└───────────────────────────────────────────┘
+        ↓ « j'écris style.css »
+┌─ Appel n°3 ─ tout ce qui précède + la suite ┐
+```
+
+**Le `.md` de l'agent est donc renvoyé à chaque action**, et l'historique grossit à chaque étape.
+
+#### Pourquoi ça ne coûte pas une fortune : le cache
+
+Le début du dossier (consigne, outils, brief) ne change pas d'un appel à l'autre : il est **mis en cache**.
+
+| Type de jeton | Coût relatif (par rapport à un jeton normal) |
+|---|---|
+| Mise en cache (la première fois) | ~2× |
+| **Relecture depuis le cache** | **~0,1×**, soit 10 fois moins cher |
+| Nouveau contenu, non mis en cache | 1× |
+| Texte écrit par le modèle | ~5× |
+
+La consigne et la liste des outils sont donc payées au prix fort **une fois**, puis presque gratuites ensuite. Le cache expire après quelques minutes d'inactivité.
+
+#### Comment le contexte circule
+
+**Il n'y a aucune mémoire partagée.** Tout passe par trois canaux :
+
+```
+   ORCHESTRATEUR (Opus)                   SOUS-AGENT (Sonnet)
+   ┌─────────────┐   ① le brief (texte) ┌────────────────┐
+   │ sa          │ ───────────────────► │ sa propre      │
+   │ conversation│                      │ conversation   │
+   │ (longue)    │ ◄─────────────────── │ (neuve, courte)│
+   └─────────────┘  ② son rapport final └────────────────┘
+          │                                     │
+          └────────── ③ les FICHIERS ───────────┘
+                    (sur le disque)
+```
+
+1. **Le brief :** c'est **tout** ce que l'agent sait de la tâche. Il ne voit pas la conversation de l'orchestrateur.
+2. **Le rapport final :** c'est **tout** ce que l'orchestrateur récupère. Il ne voit ni les fichiers lus par l'agent ni ses étapes intermédiaires.
+3. **Les fichiers :** c'est la mémoire commune. Le coder écrit `index.html`, le reviewer le lit, Qwen le reçoit avec `-InputFile`.
+
+C'est **voulu, et c'est là que se fait l'économie**. Si le coder recevait tout l'historique de l'orchestrateur, chacun de ses appels coûterait une fortune. Ici, il part d'un dossier neuf de quelques milliers de jetons.
+
+#### L'arrière-plan
+
+- L'orchestrateur lance un agent **en arrière-plan** : l'agent fait ses propres appels à l'API de son côté.
+- Pendant ce temps, l'orchestrateur peut lancer d'autres agents ou d'autres commandes : c'est le **parallélisme**.
+- Quand l'agent a fini, l'application **réveille** l'orchestrateur avec une notification, et le rapport de l'agent s'ajoute à sa conversation.
+- **Qwen et Codex** sont des **programmes séparés**. L'orchestrateur les lance par une commande, ils travaillent avec leur propre contexte (et, pour Codex, sur l'abonnement OpenAI), puis ils déposent un fichier. L'orchestrateur ne lit que leur ligne de confirmation (`-OutFile`, `--output-last-message`).
+
+#### Ce qu'on a mesuré sur la démo
+
+Usage effectif estimé de la session (cache relu ×0,1, mis en cache ×2, texte écrit ×5), environ 2,7 millions de jetons équivalents au total :
+
+| Poste | Part | Explication |
+|---|---|---|
+| La conversation de l'orchestrateur | 57 % | Une longue session d'apprentissage, relue à chaque réponse |
+| Les instructions de Claude | 26 % | Consignes et liste d'outils (environ 69 000 jetons), relues en cache à chaque tour |
+| Les 4 sous-agents Sonnet | 12,5 % | Tout le vrai travail de la démo, et sur un modèle moins cher qu'Opus |
+| Fichiers et commandes | 4 % | Lectures, appels à Qwen et à Codex, vérifications |
+| Qwen et Codex | ~0 % | Ils travaillent hors de Claude |
+
+**Conclusion :** la délégation fonctionne. Ce qui coûte le plus cher, c'est **la longueur de la conversation de l'orchestrateur**.
+
+#### Les bonnes pratiques qui en découlent
+
+| Levier | Pourquoi |
+|---|---|
+| **Un `.md` d'agent court** | Il est payé à chaque lancement d'agent (mise en cache), puis relu à chaque étape |
+| **Limiter les outils** (`tools:`) | La liste des outils est souvent **plus lourde que la consigne**. Un agent en lecture seule démarre avec un dossier plus léger |
+| **Donner des chemins, pas du contenu** | « Lis `index.html` » plutôt que coller le fichier dans le brief : l'agent ne lit que ce dont il a besoin |
+| **Exiger un rapport court** | Le rapport revient dans la conversation de l'orchestrateur, la plus chère, et y reste pour la suite |
+| **Peu d'agents, avec des tâches substantielles** | Chaque lancement repaie le démarrage. Dix micro-agents coûtent plus cher qu'un agent qui fait dix choses |
+| **Des sessions courtes pour l'orchestrateur** | Pour un nouveau projet, repartir d'une session neuve (en s'appuyant sur ce guide) plutôt que de prolonger une longue conversation |
+
 ---
 
 ## 3. Prérequis et installation
